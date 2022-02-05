@@ -1,0 +1,223 @@
+#!/usr/bin/env bash
+# shellcheck disable=SC2034
+
+set -o errexit -o errtrace -o nounset -o pipefail
+
+: "${BASH_SOURCE[0]}"
+# shellcheck disable=SC2155
+readonly SCRIPT_DIR="$(cd "$(dirname "$_")" && pwd)" \
+         SCRIPT_NAME="$(basename "$_")"
+readonly SCRIPT_SELF="${SCRIPT_DIR}/${SCRIPT_NAME}"
+
+readonly -a SCRIPT_GETOPT_OPTS=(
+  --name "$SCRIPT_NAME"
+  --options ''
+  --longoptions 'name:,email:,passphrase:,passphrase-file:,output-dir:'
+)
+
+declare OPT_NAME="${GPG_USER_NAME:-"$USER"}" \
+        OPT_EMAIL="${GPG_USER_EMAIL:-"${USER}@localhost"}" \
+        OPT_PASSPHRASE="${GPG_PASSPHRASE:-}" \
+        OPT_PASSPHRASE_FILE="${GPG_PASSPHRASE_FILE:-}" \
+        OPT_OUTPUT_DIR="${GPG_OUTPUT_DIR:-}"
+
+# shellcheck disable=SC1091
+source "${SCRIPT_DIR}/bootstrap/bootstrap.sh"
+
+if ! OPTS="$(getopt "${SCRIPT_GETOPT_OPTS[@]}" -- "$@")"
+then :die "${SCRIPT_NAME}: invalid options, exiting"
+fi
+
+eval "set -- ${OPTS}"
+unset -v OPTS
+
+while [[ $# -gt 0 ]]
+do
+  case "$1"
+  in
+    '--name')
+      OPT_NAME="$2"
+      shift
+      ;;
+    '--email')
+      OPT_EMAIL="$2"
+      shift
+      ;;
+    '--passphrase')
+      OPT_PASSPHRASE="$2"
+      shift
+      ;;
+    '--passphrase-file')
+      OPT_PASSPHRASE_FILE="$2"
+      shift
+      ;;
+    '--output-dir')
+      OPT_OUTPUT_DIR="$2"
+      shift
+      ;;
+    '--')
+      shift
+      break
+      ;;
+    *)
+      :die "${SCRIPT_NAME}: invalid option ${1}, exiting"
+      ;;
+  esac
+  shift
+done
+
+if [[ ! "${OPT_NAME:+"x"}" ]]
+then :die "${SCRIPT_NAME}: name is required, exiting"
+fi
+
+if [[ ! "${OPT_EMAIL:+"x"}" ]]
+then :die "${SCRIPT_NAME}: email is required, exiting"
+fi
+
+if [[ "${OPT_PASSPHRASE_FILE:+"x"}" && ! -r "$OPT_PASSPHRASE_FILE" ]]
+then :die "${SCRIPT_NAME}: passphrase file is not readable, exiting"
+fi
+
+readonly OPT_NAME OPT_EMAIL OPT_PASSPHRASE OPT_PASSPHRASE_FILE OPT_OUTPUT_DIR
+
+OUTPUT_DIR="${OPT_OUTPUT_DIR:-}"
+
+if [[ ! "${OUTPUT_DIR:+"x"}" ]]
+then OUTPUT_DIR="$(mktemp --directory)"
+fi
+
+readonly OUTPUT_DIR
+
+if [[ ! -d "$OUTPUT_DIR" ]]
+then mkdir --verbose "$OUTPUT_DIR"
+fi
+
+# shellcheck disable=SC2155
+readonly ARTIFACT_DIR="${OUTPUT_DIR}/gpg-gen-$(date '+%Y%m%d%H%M%S')"
+mkdir --mode=700 --verbose "$ARTIFACT_DIR"
+
+# shellcheck disable=SC2155
+readonly WORK_DIR="$(mktemp --directory)"
+
+readonly GPG_HOME_DIR="${WORK_DIR}/gnupg"
+mkdir --mode=700 "$GPG_HOME_DIR"
+
+readonly GPG_OPTIONS_FILE="${GPG_HOME_DIR}/gpg.conf"
+
+cp --verbose "${SCRIPT_DIR}/gpg.conf" "$GPG_OPTIONS_FILE"
+chmod --changes 600 "$GPG_OPTIONS_FILE"
+
+function :gpg () {
+  gpg --homedir "$GPG_HOME_DIR" \
+      --options "$GPG_OPTIONS_FILE" \
+      "$@"
+}
+
+readonly PASSPHRASE_FILE="${ARTIFACT_DIR}/.passphrase"
+
+touch "$PASSPHRASE_FILE"
+chmod --changes 600 "$PASSPHRASE_FILE"
+
+if [[ "${OPT_PASSPHRASE_FILE:+"x"}" ]]
+then : "$(<"$OPT_PASSPHRASE_FILE")"
+elif [[ "${OPT_PASSPHRASE:+"x"}" ]]
+then : "$OPT_PASSPHRASE"
+else
+  : 'abcdefghijkmnpqrstuvwxyzABCDEFGHJKLMNPQRSTUVWXYZ23456789 !"#$%&'"'"'()*+,-./:;<=>?@[\]^_`{|}~'
+  : "$(tr --delete --complement "$_" 0</dev/urandom | fold --width=32 | head --lines=1)"
+fi
+
+:print "$_" 1>"$PASSPHRASE_FILE"
+chmod --changes 400 "$PASSPHRASE_FILE"
+
+readonly -a GPG_PASSPHRASE_OPTS=(
+  --passphrase-file "$PASSPHRASE_FILE"
+  --pinentry-mode loopback
+)
+
+readonly COMPOSE_FILE="${WORK_DIR}/compose"
+
+cat - 1>"$COMPOSE_FILE" 0<<EOF
+Key-Type: RSA
+Key-Length: 4096
+Key-Usage: cert
+Expire-Date: 0
+Name-Real: ${OPT_NAME}
+Name-Email: ${OPT_EMAIL}
+%commit
+EOF
+
+:log 'Generating primary key...'
+
+{
+  :define FINGERPRINT < <(
+    {
+      :gpg --batch --status-fd 3 "${GPG_PASSPHRASE_OPTS[@]}" --generate-key "$COMPOSE_FILE"
+    } 4>&1 1>&3 3>&4 | {
+      awk '/^\[GNUPG:\]/ && $2 == "KEY_CREATED" && $3 == "P" {print $4}'
+    }
+  )
+} 3>&1
+
+readonly FINGERPRINT
+
+:log 'Generating sub key: sign...'
+:gpg "${GPG_PASSPHRASE_OPTS[@]}" --quick-add-key "$FINGERPRINT" 'rsa4096' 'sign' '1y'
+
+:log 'Generating sub key: encr...'
+:gpg "${GPG_PASSPHRASE_OPTS[@]}" --quick-add-key "$FINGERPRINT" 'rsa4096' 'encr' '1y'
+
+:log 'Generating sub key: auth...'
+:gpg "${GPG_PASSPHRASE_OPTS[@]}" --quick-add-key "$FINGERPRINT" 'rsa4096' 'auth' '1y'
+
+:gpg --list-secret-keys
+
+:log 'Exporting primary key...'
+
+:gpg "${GPG_PASSPHRASE_OPTS[@]}" \
+  --output "${ARTIFACT_DIR}/primary.key" \
+  --export-secret-keys "$FINGERPRINT"
+
+chmod --changes 400 "${ARTIFACT_DIR}/primary.key"
+
+:gpg "${GPG_PASSPHRASE_OPTS[@]}" --armor \
+  --output "${ARTIFACT_DIR}/primary.key.asc" \
+  --export-secret-keys "$FINGERPRINT"
+
+chmod --changes 400 "${ARTIFACT_DIR}/primary.key.asc"
+
+:gpg --armor --output "${ARTIFACT_DIR}/primary.pub.asc" --export "$FINGERPRINT"
+
+chmod --changes 440 "${ARTIFACT_DIR}/primary.pub.asc"
+
+:log 'Generating revocation certificate...'
+:gpg --status-fd 2 --command-fd 3 "${GPG_PASSPHRASE_OPTS[@]}" --armor \
+  --output "${ARTIFACT_DIR}/revocation.crt" \
+  --generate-revocation "$FINGERPRINT" 3<<'EOS'
+y
+0
+
+y
+EOS
+
+chmod --changes 400 "${ARTIFACT_DIR}/revocation.crt"
+
+:log 'Exporting sub keys...'
+
+:gpg "${GPG_PASSPHRASE_OPTS[@]}" \
+  --output "${ARTIFACT_DIR}/sub.key" \
+  --export-secret-subkeys "$FINGERPRINT"
+
+chmod --changes 400 "${ARTIFACT_DIR}/sub.key"
+
+:gpg "${GPG_PASSPHRASE_OPTS[@]}" --armor \
+  --output "${ARTIFACT_DIR}/sub.key.asc" \
+  --export-secret-subkeys "$FINGERPRINT"
+
+chmod --changes 400 "${ARTIFACT_DIR}/sub.key.asc"
+
+tar --create --gzip --file="${ARTIFACT_DIR}/gnupg.tar.gz" --verbose \
+  --directory="$(dirname "$GPG_HOME_DIR")" \
+  "$(basename "$GPG_HOME_DIR")"
+
+rm --recursive --force --verbose "$WORK_DIR"
